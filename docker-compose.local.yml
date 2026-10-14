@@ -1,0 +1,126 @@
+# Stage L3: the full local stack, with local stand-ins for AWS.
+# Run: docker compose -f docker-compose.local.yml up --build
+# Tear down: docker compose -f docker-compose.local.yml down -v
+#
+# Everything here is Stage L only. None of it is used in Stage D (AWS): the
+# broker and worker images are the same ones Stage D uses, but pointed at
+# local endpoints instead of real AWS via DYNAMODB_ENDPOINT_URL,
+# SQS_ENDPOINT_URL, and DNS_ADAPTER=noop.
+
+x-aws-env: &aws-env
+  AWS_REGION: ap-south-1
+  AWS_ACCESS_KEY_ID: local
+  AWS_SECRET_ACCESS_KEY: local
+  TENANTS_TABLE: osb-dev-tenants
+  HOSTNAMES_TABLE: osb-dev-hostnames
+  API_KEYS_TABLE: osb-dev-api-keys
+  DYNAMODB_ENDPOINT_URL: http://dynamodb-local:8000
+  SQS_ENDPOINT_URL: http://elasticmq:9324
+  PROVISION_QUEUE_URL: http://elasticmq:9324/queue/osb-dev-provision
+
+services:
+  dynamodb-local:
+    image: amazon/dynamodb-local@sha256:ff89bd48ff32cd8d9be5fee8873b65b8854dc408f1afe881be6eb00247bc0dab
+    command: ["-jar", "DynamoDBLocal.jar", "-inMemory", "-sharedDb"]
+
+  elasticmq:
+    image: softwaremill/elasticmq-native@sha256:e4580ab9ad1bd5cd37b4ba04911bc5ccc8cd2d9ab4de56ece65acee71c24e05c
+
+  init-aws:
+    build:
+      context: .
+      dockerfile: services/worker/Dockerfile # has boto3; the init script needs nothing else
+    environment: *aws-env
+    entrypoint: ["python", "/app/services/local/init_aws.py"]
+    volumes:
+      - ./services/local/init_aws.py:/app/services/local/init_aws.py:ro
+    depends_on: [dynamodb-local, elasticmq]
+    restart: "no"
+
+  broker:
+    build:
+      context: .
+      dockerfile: services/broker/Dockerfile
+    environment:
+      <<: *aws-env
+      ZONE_SUFFIX: osb.internal
+    ports: ["8001:8000"] # host:container, for manual curl checks
+    depends_on:
+      init-aws: { condition: service_completed_successfully }
+    networks:
+      default:
+        aliases: [broker.osb.internal] # matches services/sovereign/config/sovereign.yaml
+
+  worker:
+    build:
+      context: .
+      dockerfile: services/worker/Dockerfile
+    environment:
+      <<: *aws-env
+      DNS_ADAPTER: noop # Route 53 has no local stand-in; see dns_noop.py
+    depends_on:
+      init-aws: { condition: service_completed_successfully }
+    restart: on-failure
+
+  sovereign:
+    build: { context: services/sovereign }
+    depends_on: [broker]
+    restart: on-failure # first context fetch can fail before the broker is ready
+    networks:
+      default:
+        aliases: [sovereign.osb.internal]
+
+  render-envoy-config:
+    image: python:3.12-slim@sha256:2b4f19dae3a777dfc3b76730bda1e82e1f66ab2a2686fa93ca78edbfb4f04ffe
+    command: ["sh", "-c", "sed 's|$${LKG_DIR}|/var/lib/osb/lkg|g' /src/envoy-lkg.yaml > /out/envoy.yaml"]
+    volumes:
+      - ./envoy/bootstrap/envoy-lkg.yaml:/src/envoy-lkg.yaml:ro
+      - envoy-config:/out
+    restart: "no"
+
+  lkg-init-listeners:
+    build: { context: envoy/lkg-agent }
+    command: ["--sovereign", "http://sovereign.osb.internal:8080", "--type", "listeners", "--out", "/var/lib/osb/lkg/lds.json", "--once"]
+    volumes: [lkg-data:/var/lib/osb/lkg]
+    depends_on: [sovereign]
+    restart: "no"
+
+  lkg-init-clusters:
+    build: { context: envoy/lkg-agent }
+    command: ["--sovereign", "http://sovereign.osb.internal:8080", "--type", "clusters", "--out", "/var/lib/osb/lkg/cds.json", "--once"]
+    volumes: [lkg-data:/var/lib/osb/lkg]
+    depends_on: [sovereign]
+    restart: "no"
+
+  lkg-agent-listeners:
+    build: { context: envoy/lkg-agent }
+    command: ["--sovereign", "http://sovereign.osb.internal:8080", "--type", "listeners", "--out", "/var/lib/osb/lkg/lds.json", "--interval", "5"]
+    volumes: [lkg-data:/var/lib/osb/lkg]
+    depends_on:
+      lkg-init-listeners: { condition: service_completed_successfully }
+    restart: always
+
+  lkg-agent-clusters:
+    build: { context: envoy/lkg-agent }
+    command: ["--sovereign", "http://sovereign.osb.internal:8080", "--type", "clusters", "--out", "/var/lib/osb/lkg/cds.json", "--interval", "5"]
+    volumes: [lkg-data:/var/lib/osb/lkg]
+    depends_on:
+      lkg-init-clusters: { condition: service_completed_successfully }
+    restart: always
+
+  envoy:
+    image: envoyproxy/envoy:v1.39.2@sha256:460f8c329f24b2e1c7c5af64cb314a6f351ad1c262ba77b135ac46b35ebd5f85
+    command: ["-c", "/etc/envoy/envoy.yaml", "--service-node", "local-envoy", "--service-cluster", "osb-dev"]
+    volumes:
+      - envoy-config:/etc/envoy
+      - lkg-data:/var/lib/osb/lkg
+    ports: ["10000:10000", "9901:9901"]
+    depends_on:
+      render-envoy-config: { condition: service_completed_successfully }
+      lkg-init-listeners: { condition: service_completed_successfully }
+      lkg-init-clusters: { condition: service_completed_successfully }
+    restart: on-failure
+
+volumes:
+  lkg-data:
+  envoy-config:

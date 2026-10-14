@@ -1,0 +1,115 @@
+{#- One virtual host per ACTIVE tenant, matched by hostname, routed to that
+   tenant's cluster (see clusters.yaml.j2). The catch-all at the end answers
+   anything that doesn't match a tenant, so the listener is never empty, even
+   with zero tenants -- an empty listener response is rejected by the LKG
+   agent as invalid.
+
+   Per-tenant isolation (Phase e): each tenant's route carries its own request
+   rate limit (local_ratelimit) and byte-rate limit (bandwidth_limit), set
+   from that tenant's own spec -- so one tenant's traffic can never use more
+   than its own share, and can never be starved by another tenant's. The
+   catch-all route uses the filter-chain defaults below, which are generous
+   on purpose: it answers only "osb edge ok", never real tenant traffic. #}
+{#- Both listeners share the same route config (same tenants, same filters);
+   only the socket differs. The TLS one is the self-signed-cert slice:
+   the cert is dev/internal-only (see docs/architecture.md for production TLS design),
+   but termination itself is real. #}
+{% macro route_config() %}
+              route_config:
+                name: local_route
+                virtual_hosts:
+{% for t in tenants.tenants %}
+                  - name: "tenant_{{ t.instance_id }}"
+                    domains: ["{{ t.hostname }}"]
+                    routes:
+                      - match: { prefix: "/" }
+                        route: { cluster: "tenant_{{ t.instance_id }}" }
+                        typed_per_filter_config:
+                          envoy.filters.http.local_ratelimit:
+                            "@type": type.googleapis.com/envoy.extensions.filters.http.local_ratelimit.v3.LocalRateLimit
+                            stat_prefix: "tenant_{{ t.instance_id }}_rps"
+                            token_bucket:
+                              max_tokens: {{ t.rate_limit_rps }}
+                              tokens_per_fill: {{ t.rate_limit_rps }}
+                              fill_interval: 1s
+                            filter_enabled:
+                              runtime_key: local_rate_limit_enabled
+                              default_value: { numerator: 100, denominator: HUNDRED }
+                            filter_enforced:
+                              runtime_key: local_rate_limit_enforced
+                              default_value: { numerator: 100, denominator: HUNDRED }
+                            response_headers_to_add:
+                              - append: false
+                                header: { key: x-local-rate-limit, value: "true" }
+                          envoy.filters.http.bandwidth_limit:
+                            "@type": type.googleapis.com/envoy.extensions.filters.http.bandwidth_limit.v3.BandwidthLimit
+                            stat_prefix: "tenant_{{ t.instance_id }}_bw"
+                            enable_mode: REQUEST_AND_RESPONSE
+                            limit_kbps: {{ t.bandwidth_kbps }}
+                            fill_interval: 0.1s
+{% endfor %}
+                  - name: osb_default
+                    domains: ["*"]
+                    routes:
+                      - match: { prefix: "/" }
+                        direct_response:
+                          status: 200
+                          body:
+                            inline_string: "osb edge ok\n"
+{% endmacro %}
+{% macro http_filters() %}
+              http_filters:
+                # Chain-level defaults: generous, since they only ever apply to the
+                # catch-all. Every tenant route overrides these with its own values above.
+                - name: envoy.filters.http.local_ratelimit
+                  typed_config:
+                    "@type": type.googleapis.com/envoy.extensions.filters.http.local_ratelimit.v3.LocalRateLimit
+                    stat_prefix: default_rps
+                    token_bucket:
+                      max_tokens: 1000000
+                      tokens_per_fill: 1000000
+                      fill_interval: 1s
+                - name: envoy.filters.http.bandwidth_limit
+                  typed_config:
+                    "@type": type.googleapis.com/envoy.extensions.filters.http.bandwidth_limit.v3.BandwidthLimit
+                    stat_prefix: default_bw
+                    enable_mode: REQUEST_AND_RESPONSE
+                    limit_kbps: 1000000
+                    fill_interval: 0.1s
+                - name: envoy.filters.http.router
+                  typed_config:
+                    "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+{% endmacro %}
+resources:
+  - "@type": type.googleapis.com/envoy.config.listener.v3.Listener
+    name: listener_http
+    address:
+      socket_address: { address: 0.0.0.0, port_value: 10000 }
+    filter_chains:
+      - filters:
+          - name: envoy.filters.network.http_connection_manager
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+              stat_prefix: ingress_http
+{{ route_config() }}
+{{ http_filters() }}
+  - "@type": type.googleapis.com/envoy.config.listener.v3.Listener
+    name: listener_https
+    address:
+      socket_address: { address: 0.0.0.0, port_value: 10443 }
+    filter_chains:
+      - transport_socket:
+          name: envoy.transport_sockets.tls
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+            common_tls_context:
+              tls_certificates:
+                - certificate_chain: { filename: "/etc/envoy/tls/cert.pem" }
+                  private_key: { filename: "/etc/envoy/tls/key.pem" }
+        filters:
+          - name: envoy.filters.network.http_connection_manager
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+              stat_prefix: ingress_https
+{{ route_config() }}
+{{ http_filters() }}

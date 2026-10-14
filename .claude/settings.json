@@ -1,0 +1,9 @@
+{
+  "$schema": "https://json.schemastore.org/partial-claude-settings.json",
+  "project": "osb-edge",
+  "language": "python",
+  "pythonVersion": "3.12",
+  "iac": "terraform",
+  "testRunner": "python3 -m unittest",
+  "orchestrator": "./deploy.sh"
+}

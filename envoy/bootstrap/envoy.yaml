@@ -1,0 +1,43 @@
+# Static Envoy bootstrap for the Phase (b) smoke test.
+# No upstream backend: the route answers directly, which proves the
+# NLB -> Envoy -> response path without depending on any tenant.
+# Replaced by xDS from Sovereign in Phase (c).
+
+admin:
+  address:
+    socket_address: { address: 0.0.0.0, port_value: 9901 }
+  access_log:
+    - name: envoy.access_loggers.stdout
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog
+
+static_resources:
+  listeners:
+    - name: listener_http
+      address:
+        socket_address: { address: 0.0.0.0, port_value: 10000 }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_http
+                access_log:
+                  - name: envoy.access_loggers.stdout
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog
+                route_config:
+                  name: local_route
+                  virtual_hosts:
+                    - name: osb_default
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          direct_response:
+                            status: 200
+                            body:
+                              inline_string: "osb edge ok\n"
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router

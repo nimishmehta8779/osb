@@ -1,0 +1,2 @@
+# The worker has no HTTP framework: it's an SQS consumer.
+boto3>=1.40,<2.0

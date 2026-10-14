@@ -1,0 +1,88 @@
+#!/bin/bash
+# Envoy host: two LKG agents (systemd, one per resource type) + Envoy container.
+# Rendered by Terraform. Runs once at first boot. Kept concise to stay
+# comfortably below EC2's 16KB raw user_data limit.
+set -euo pipefail
+
+dnf install -y -q docker
+systemctl enable --now docker
+
+dnf install -y -q amazon-cloudwatch-agent
+mkdir -p /opt/aws/amazon-cloudwatch-agent/etc
+cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<'CWAGENT'
+{
+  "logs": {
+    "logs_collected": {
+      "files": {
+        "collect_list": [
+          {
+            "file_path": "/var/lib/docker/containers/*/*-json.log",
+            "log_group_name": "${log_group}",
+            "log_stream_name": "{instance_id}",
+            "timezone": "UTC"
+          }
+        ]
+      }
+    }
+  }
+}
+CWAGENT
+/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+  -a fetch-config -m ec2 -s -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json \
+  || echo "cloudwatch agent config failed to apply; continuing without shipped logs"
+
+mkdir -p /opt/osb /etc/envoy /etc/envoy/tls ${lkg_dir}
+
+# agent.py comes from S3, not embedded base64, to avoid exceeding EC2's 16KB user_data limit.
+aws s3 cp --region ${region} "s3://${agent_s3_bucket}/${agent_s3_key}" /opt/osb/agent.py
+
+echo "${tls_cert_b64}" | base64 -d > /etc/envoy/tls/cert.pem
+echo "${tls_key_b64}" | base64 -d > /etc/envoy/tls/key.pem
+chmod 644 /etc/envoy/tls/key.pem # not 600: envoy's container runs as uid 101, not root
+
+cat > /etc/envoy/envoy.yaml <<'ENVOY_CONFIG'
+${envoy_config}
+ENVOY_CONFIG
+
+# Envoy needs a node id when it loads config. Use the hostname so each host is unique.
+sed -i "/^node:/a\\  id: $(hostname)" /etc/envoy/envoy.yaml
+
+# Envoy's dynamic_resources read lds.json (listeners) and cds.json (clusters).
+declare -A OUT_FILE=( [listeners]="${lkg_dir}/lds.json" [clusters]="${lkg_dir}/cds.json" )
+
+for kind in listeners clusters; do
+  cat > /etc/systemd/system/osb-lkg-agent-$kind.service <<UNIT
+[Unit]
+Description=OSB last-known-good xDS agent ($kind)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 /opt/osb/agent.py --sovereign http://${sovereign_endpoint}:8080 --type $kind --out $${OUT_FILE[$kind]} --interval 15
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+done
+
+systemctl daemon-reload
+
+# First sync before Envoy starts, so Envoy boots with a config when Sovereign is up.
+# If Sovereign is down now, Envoy starts without config and the agents fill it in later.
+for kind in listeners clusters; do
+  /usr/bin/python3 /opt/osb/agent.py --sovereign http://${sovereign_endpoint}:8080 --type $kind --out "$${OUT_FILE[$kind]}" --once \
+    || echo "initial $kind sync failed; the agent will retry"
+done
+
+systemctl enable --now osb-lkg-agent-listeners osb-lkg-agent-clusters
+
+docker pull ${envoy_image}
+docker rm -f envoy 2>/dev/null || true
+docker run -d --name envoy --restart unless-stopped \
+  -p 10000:10000 -p 10443:10443 -p 9901:9901 \
+  -v /etc/envoy/envoy.yaml:/etc/envoy/envoy.yaml:ro \
+  -v /etc/envoy/tls:/etc/envoy/tls:ro \
+  -v ${lkg_dir}:${lkg_dir} \
+  ${envoy_image} -c /etc/envoy/envoy.yaml

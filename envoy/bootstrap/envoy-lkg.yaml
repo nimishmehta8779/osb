@@ -1,0 +1,29 @@
+# Phase (c)/(d) bootstrap with last-known-good.
+# Envoy reads listeners and clusters from local files written by the lkg-agent,
+# not from Sovereign directly. A restart works even when Sovereign is down.
+# Two separate agent processes write these files: one for listeners, one for
+# clusters (see envoy/install/user_data.sh.tftpl).
+
+node:
+  cluster: osb-dev
+  user_agent_name: envoy
+  user_agent_build_version:
+    version: { major_number: 1, minor_number: 39, patch: 2 }
+
+admin:
+  address:
+    socket_address: { address: 0.0.0.0, port_value: 9901 }
+
+dynamic_resources:
+  lds_config:
+    resource_api_version: V3
+    path_config_source:
+      path: ${LKG_DIR}/lds.json
+      watched_directory:
+        path: ${LKG_DIR}
+  cds_config:
+    resource_api_version: V3
+    path_config_source:
+      path: ${LKG_DIR}/cds.json
+      watched_directory:
+        path: ${LKG_DIR}

@@ -1,0 +1,32 @@
+{#- One cluster per ACTIVE tenant. Zero tenants is a valid state (empty
+   resources list), unlike the listener, which always has the catch-all.
+
+   Circuit breakers (Phase e): derived from the tenant's own rate_limit_rps,
+   so one tenant exhausting its connection pool never touches another
+   tenant's cluster -- each cluster's limits are its own. #}
+{% if not tenants.tenants %}
+resources: []
+{% else %}
+resources:
+{% for t in tenants.tenants %}
+  - "@type": type.googleapis.com/envoy.config.cluster.v3.Cluster
+    name: "tenant_{{ t.instance_id }}"
+    connect_timeout: 2s
+    type: STRICT_DNS
+    dns_lookup_family: V4_ONLY
+    circuit_breakers:
+      thresholds:
+        - priority: DEFAULT
+          max_connections: {{ t.rate_limit_rps }}
+          max_pending_requests: {{ (t.rate_limit_rps // 10) + 10 }}
+          max_requests: {{ t.rate_limit_rps * 2 }}
+          max_retries: 3
+    load_assignment:
+      cluster_name: "tenant_{{ t.instance_id }}"
+      endpoints:
+        - lb_endpoints:
+            - endpoint:
+                address:
+                  socket_address: { address: "{{ t.backend_host }}", port_value: {{ t.backend_port }} }
+{% endfor %}
+{% endif %}

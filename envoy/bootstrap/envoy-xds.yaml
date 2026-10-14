@@ -1,0 +1,37 @@
+# Phase (c) bootstrap: listeners come from Sovereign over REST xDS.
+# Last-known-good handling is a separate step; this file only covers discovery.
+
+node:
+  cluster: osb-dev
+  id: ${NODE_ID}
+  user_agent_name: envoy
+  user_agent_build_version:
+    version: { major_number: 1, minor_number: 39, patch: 2 }
+
+admin:
+  address:
+    socket_address: { address: 0.0.0.0, port_value: 9901 }
+
+dynamic_resources:
+  lds_config:
+    resource_api_version: V3
+    api_config_source:
+      api_type: REST
+      transport_api_version: V3
+      cluster_names: [sovereign]
+      refresh_delay: 15s
+      request_timeout: 5s
+
+static_resources:
+  clusters:
+    - name: sovereign
+      connect_timeout: 2s
+      type: STRICT_DNS
+      dns_lookup_family: V4_ONLY
+      load_assignment:
+        cluster_name: sovereign
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: ${SOVEREIGN_HOST}, port_value: ${SOVEREIGN_PORT} }

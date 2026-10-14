@@ -1,0 +1,28 @@
+# Sovereign v2 config (sovereign==0.32.12).
+# Templates are keyed by Envoy version. Envoy nodes report their build version,
+# and Sovereign picks the matching template set.
+templates:
+  "1.39.2":
+    - type: listeners
+      spec:
+        protocol: file
+        serialization: jinja
+        path: templates/1.39.2/listeners.yaml.j2
+    - type: clusters
+      spec:
+        protocol: file
+        serialization: jinja
+        path: templates/1.39.2/clusters.yaml.j2
+
+# Tenant data comes from the broker's read-only context endpoint (ACTIVE tenants
+# only). "http" here is Sovereign's plain GET-and-deserialize loader, not a
+# proxy or auth-aware client: the endpoint must stay unauthenticated and
+# internal-only, which /internal/context/tenants already is.
+template_context:
+  context:
+    tenants:
+      protocol: http
+      serialization: json
+      path: http://broker.osb.internal:8000/internal/context/tenants
+  refresh: true
+  refresh_rate: 15

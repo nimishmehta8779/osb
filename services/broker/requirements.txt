@@ -1,0 +1,5 @@
+# Versions match what services/broker/app/main.py was tested against.
+fastapi==0.139.2
+uvicorn[standard]>=0.40,<0.41
+pydantic>=2.12,<3.0
+boto3>=1.40,<2.0
